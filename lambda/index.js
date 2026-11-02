@@ -21,13 +21,32 @@ var crypto = require('crypto');
 
 var endpoint = process.env.ES_ENDPOINT;
 
+// CloudWatch Logs delivers a gzip-compressed batch that can expand ~1000:1.
+// Cap the decompressed size so a highly repetitive or unusually large batch
+// cannot exhaust the function's memory. The value is a policy choice, not a
+// measured requirement; it is sized to keep the whole handler within the
+// 128 MB that HIDSLambdaConsumer is allocated in the CloudFormation template.
+var MAX_DECOMPRESSED_BYTES = 3 * 1024 * 1024;
+
 exports.handler = function(input, context) {
     // decode input from base64
     var zippedInput = new Buffer.from(input.awslogs.data, 'base64');
 
     // decompress the input
-    zlib.gunzip(zippedInput, function(error, buffer) {
-        if (error) { context.fail(error); return; }
+    zlib.gunzip(zippedInput, { maxOutputLength: MAX_DECOMPRESSED_BYTES }, function(error, buffer) {
+        if (error) {
+            if (error.code === 'ERR_BUFFER_TOO_LARGE') {
+                // The batch is larger than this function can process. Drop it
+                // with a log line instead of failing the invocation: retrying
+                // a deterministic size failure only burns more memory. The
+                // events remain in the source log group for re-processing.
+                console.log('Dropped oversized CloudWatch Logs batch: decompressed size exceeds ' +
+                    MAX_DECOMPRESSED_BYTES + ' bytes');
+                context.succeed('Oversized batch dropped');
+                return;
+            }
+            context.fail(error); return;
+        }
 
         // parse the input from JSON
         var awslogsData = JSON.parse(buffer.toString('utf8'));
